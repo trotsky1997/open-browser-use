@@ -99,13 +99,13 @@ const popup = await waiting;
 `browser.tabs.list()` exposes an `openerTabId` when both tabs are in the
 same session and the backend knows the opener.
 It polls owned tabs, so a popup closed before observation or without an opener
-can time out. Chrome uses navigation-target events for controlled source tabs when available; both source and target must belong to the same session. This in-memory source record is lost if the extension service worker restarts. Concurrent matching popups are rejected as ambiguous, and only one popup
+can time out. Chrome uses navigation-target events from controlled source tabs to associate new ungrouped popup windows with that session. Moving a popup into another group revokes its previous ownership. These source and ownership records are in memory and are lost if the extension service worker restarts; released ungrouped popups remain open and can be explicitly claimed again. Concurrent matching popups are rejected as ambiguous, and only one popup
 expectation per opener can run in a browser instance. The timeout includes
 tab-list preparation. If preparation times out, the action is not issued;
 a timeout after the action starts means it may still be running, so inspect
 the session before retrying. Chrome popups with
 no recorded session origin are released rather than closed by finalization;
-close a popup explicitly when appropriate. Electron finalization closes unkept
+close a popup explicitly when appropriate. Chrome popup windows cannot be grouped as `deliverable`; use `handoff` to keep them in the session. Electron finalization closes unkept
 popups when they have no pending operation.
 
 `browser.newTab({url})` closes the newly created tab when navigation fails. If

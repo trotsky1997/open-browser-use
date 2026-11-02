@@ -590,3 +590,5 @@ Playwright 风格 waitForEvent("dialog") 在后续 SDK 输入前注册监听，�
 新增 Playwright 风格 waitForEvent("popup")，获取标签基线后放行后续 SDK 输入，复用 opener 匹配及歧义检查。SDK 120 项检查通过；Linux ARM64 Chromium 原生消息实测已呈现标签的真实链接和新页 URL。隔离 Chromium 中后台标签打开的新页被浏览器报告为当前选中标签的子页，等待超时；显式呈现发起标签后通过。Windows 未测。
 
 Chrome 扩展新增 webNavigation 权限，使用导航目标事件记录受控来源标签与新标签 ID；仅在两者属于原会话时提供来源信息，目标关闭或 service worker 重启清理记录。已观测来源不属于查询会话时，不回退到可能错误的标签 opener。扩展 51 项检查通过；Linux ARM64 Chromium 原生消息实测后台普通及 noopener 链接、双会话隔离。新权限可能触发扩展更新确认；跨窗口未归入会话的新页及 worker 重启后的来源恢复仍待处理，Windows 未测。
+
+Chrome 根据受控来源的导航目标事件，将未分组独立窗口纳入来源会话；来源关闭后已取得的目标继续受控，其他会话接管被拒绝，用户移组后撤销，结束时释放未保留窗口。创建会话组显式指定标签所在窗口。扩展 60 项检查通过；Linux ARM64 Chromium 原生消息实测后台 popup、可信点击、双会话隔离、来源关闭、handoff、释放保留窗口、无标签组新会话显式接管，以及弹窗置顶时新会话创建。popup 窗口不能加入 deliverable 组，操作在变更其他标签前拒绝并提示 handoff。独立窗口归属目前保存在 service worker 内存，重启后需重新接管；Windows 未测。

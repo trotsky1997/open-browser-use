@@ -386,6 +386,8 @@ class BrowserBackend {
     if (groupId !== -1) this.pendingUngrouped.delete(tabId);
     if (owner) this.sessionByTabId.set(tabId, owner); else this.sessionByTabId.delete(tabId);
     if (!previous || (previous === owner && !ungrouped)) return;
+    const source=this.navigationSourcesByTabId.get(tabId);
+    if (source?.sessionId === previous) source.released=true;
     this.debuggerSessionByTabId.delete(tabId);
     const wasActive = this.activeTabsBySession.get(previous) === tabId;
     if (wasActive) this.activeTabsBySession.delete(previous);
@@ -457,7 +459,7 @@ class BrowserBackend {
     const owned = new Set(tabs.map(tab => tab.id));
     return await this.withLogicalActive(session.sessionId, tabs.map(tab => {
       const source=this.navigationSourcesByTabId.get(tab.id);
-      const opener=source ? (source.sessionId === session.sessionId ? source.sourceTabId : undefined) : tab.openerTabId;
+      const opener=source ? (!source.released && source.sessionId === session.sessionId ? source.sourceTabId : undefined) : tab.openerTabId;
       return {...toBrowserTab(tab),...(owned.has(opener) ? {openerTabId:opener} : {})};
     }));
   }
@@ -549,6 +551,8 @@ class BrowserBackend {
     if (!hasTabId(tab)) {
       throw new Error(`Chrome tab ${tabId} has no id`);
     }
+    const currentOwner=this.sessionByTabId.get(tabId);
+    if (currentOwner && currentOwner !== session.sessionId) throw new Error(`Tab ${tabId} is already part of browser session ${currentOwner}`);
     if (tab.url?.startsWith("chrome://")) {
       throw new Error(`Chrome internal tab ${tabId} cannot be claimed`);
     }
@@ -557,6 +561,20 @@ class BrowserBackend {
       if (owner && owner.sessionId !== session.sessionId) {
         throw new Error(`Tab ${tabId} is already part of browser session ${owner.sessionId}`);
       }
+    }
+    const window=tab.groupId === -1 && typeof tab.windowId === "number" ? await chrome.windows.get(tab.windowId) : null;
+    if (window?.type === "popup") {
+      const revision=this.tabGroupRevisions.get(tabId) ?? 0;
+      const state=await this.store.getSession(session.sessionId);
+      const latest=await chrome.tabs.get(tabId);
+      const owner=this.sessionByTabId.get(tabId);
+      if (latest.groupId !== -1 || latest.windowId !== tab.windowId || (this.tabGroupRevisions.get(tabId) ?? 0)!==revision || (owner && owner !== session.sessionId)) throw new Error("Tab ownership changed while claiming popup");
+      this.navigationSourcesByTabId.set(tabId,{sessionId:session.sessionId,claimed:true});
+      this.sessionByTabId.set(tabId,session.sessionId);
+      state.tabOrigins[String(tabId)]="user";
+      await this.store.save();
+      await this.setSessionActiveTab(session.sessionId,tabId);
+      return {...toBrowserTab(latest),active:true};
     }
     await this.ensureSessionGroup(session.sessionId, tab.id, "user");
     await this.setSessionActiveTab(session.sessionId, tab.id);
@@ -612,6 +630,12 @@ class BrowserBackend {
         userTabsToRelease.push(tab.id);
       }
     }
+    for (const tab of tabs) {
+      if (keep.get(tab.id) === "deliverable" && tab.groupId === -1 && typeof tab.windowId === "number") {
+        const window=await chrome.windows.get(tab.windowId);
+        if (window.type === "popup") throw new Error("Popup windows cannot be grouped as deliverables; use handoff instead");
+      }
+    }
     // Detach every disposition, including handoff tabs we keep alive: leaving a
     // tab attached keeps Chrome's "started debugging this browser" banner up
     // after the turn ends. The debugger re-attaches lazily on the next CDP call
@@ -633,12 +657,14 @@ class BrowserBackend {
       }
     };
     await dispose(agentTabsToClose, (tabId) => chrome.tabs.remove(tabId));
-    if (chrome.tabs.ungroup) await dispose(userTabsToRelease, (tabId) => chrome.tabs.ungroup(tabId));
+    const groupedUserTabs=userTabsToRelease.filter(tabId => tabs.find(tab => tab.id === tabId)?.groupId !== -1);
+    if (chrome.tabs.ungroup) await dispose(groupedUserTabs, (tabId) => chrome.tabs.ungroup(tabId));
     if (deliverableTabs.length > 0) {
       await this.moveToDeliverables(deliverableTabs);
     }
     for (const tabId of [...agentTabsToClose, ...userTabsToRelease, ...deliverableTabs]) {
       delete sessionState.tabOrigins[String(tabId)];
+      this.navigationSourcesByTabId.delete(tabId);
       this.cursorByTabId.delete(tabId);
       if (!agentTabsToClose.includes(tabId)) this.sessionByTabId.delete(tabId);
     }
@@ -1312,7 +1338,8 @@ class BrowserBackend {
       }
     }
     if (typeof groupId !== "number") {
-      groupId = await chrome.tabs.group({ tabIds: [tabId] });
+      const tab=await chrome.tabs.get(tabId);
+      groupId = await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
       session.chromeGroupId = groupId;
     }
     session.tabOrigins[String(tabId)] = origin;
@@ -1327,22 +1354,36 @@ class BrowserBackend {
 
   async setSessionActiveTab(sessionId, tabId) {
     const session = await this.store.getSession(sessionId);
+    if (this.sessionByTabId.get(tabId) !== sessionId) throw new Error("Tab ownership changed");
     session.activeTabId = tabId;
     this.activeTabsBySession.set(sessionId, tabId);
     await this.store.save();
+    if (this.sessionByTabId.get(tabId) !== sessionId) throw new Error("Tab ownership changed");
     await this.publishCursorState(tabId);
   }
 
   async getSessionTabs(sessionId) {
     const session = await this.store.getSession(sessionId);
-    if (typeof session.chromeGroupId !== "number") {
-      return [];
-    }
     try {
       const revision = this.groupRevision;
-      const tabs = (await chrome.tabs.query({ groupId: session.chromeGroupId })).filter(
+      const grouped=typeof session.chromeGroupId === "number" ? await chrome.tabs.query({ groupId: session.chromeGroupId }) : [];
+      const tabs = grouped.filter(
         (tab) => hasTabId(tab) && !tab.url?.startsWith("chrome://") && (this.tabGroupRevisions.get(tab.id) ?? 0) <= revision
       );
+      const known=new Set(tabs.map(tab=>tab.id));
+      const sources=[...this.navigationSourcesByTabId.entries()].filter(([,source])=>source.sessionId===sessionId && !source.released);
+      const candidates=await Promise.all(sources.map(async ([id,source])=>({id,source,tab:await chrome.tabs.get(id).catch(()=>null)})));
+      let changed=true;
+      while(changed) {
+        changed=false;
+        for(const {id,source,tab} of candidates) {
+          if(known.has(id) || !tab || tab.groupId!==-1 || tab.url?.startsWith("chrome://") || source.released || this.navigationSourcesByTabId.get(id)!==source || (this.tabGroupRevisions.get(id) ?? 0)>revision || (this.tabGroupRevisions.get(source.sourceTabId) ?? 0)>revision) continue;
+          const existing=this.sessionByTabId.get(id);
+          if(existing && existing!==sessionId)continue;
+          if(!(source.claimed && existing===sessionId) && !known.has(source.sourceTabId))continue;
+          source.claimed=true;known.add(id);tabs.push(tab);changed=true;
+        }
+      }
       for (const tab of tabs) this.sessionByTabId.set(tab.id, sessionId);
       return tabs;
     } catch {
@@ -1446,7 +1487,7 @@ class BrowserBackend {
       }
 
       if (typeof primaryGroupId !== "number") {
-        primaryGroupId = await chrome.tabs.group({ tabIds: windowTabIds });
+        primaryGroupId = await chrome.tabs.group({ tabIds: windowTabIds, createProperties: { windowId } });
       }
 
       await chrome.tabGroups
