@@ -8,7 +8,7 @@ const source=await readFile(new URL('./background.js',import.meta.url),'utf8');
 const end=source.indexOf('chrome.runtime.onInstalled.addListener');
 assert.notEqual(end,-1);
 const commands=[];
-const chrome={debugger:{onDetach:{addListener(){}},async sendCommand(target,method,params){commands.push({target,method,params});}},storage:{local:{async get(){return {};},async set(){}}}};
+const chrome={debugger:{onDetach:{addListener(){}},async getTargets(){return [2,7].map(tabId=>({tabId,type:'page',id:`target-${tabId}`}));},async sendCommand(target,method,params){commands.push({target,method,params});}},storage:{local:{async get(){return {};},async set(){}}}};
 const Backend=vm.runInNewContext(`${source.slice(0,end)}\nBrowserBackend;`,{chrome,crypto:webcrypto,Date,setTimeout,clearTimeout,AbortController});
 
 test('tab presentation reports physical selection only for owned tabs',async()=>{
@@ -346,7 +346,7 @@ test('navigation targets use the observed source only inside its owning session'
 
 test('ungrouped navigation targets stay scoped and respect later group moves',async()=>{
   const oldTabs=chrome.tabs,oldNav=chrome.webNavigation;let observe;
-  const tabs=new Map([[1,{id:1,groupId:1,url:'https://example.test/'}],[2,{id:2,groupId:-1,url:'https://example.test/popup'}]]);
+  const tabs=new Map([[1,{id:1,groupId:1,url:'https://example.test/'}],[2,{id:2,groupId:-1,windowId:2,url:'https://example.test/popup'}]]);
   chrome.tabs={query:async({groupId})=>[...tabs.values()].filter(tab=>tab.groupId===groupId).map(tab=>({...tab})),get:async id=>({...tabs.get(id)})};
   chrome.webNavigation={onCreatedNavigationTarget:{addListener(callback){observe=callback;}}};
   try {
@@ -429,5 +429,71 @@ test('a delayed popup lookup cannot claim a tab moved to another session',async(
     const backend=new Backend();await backend.store.ready;backend.store.state.sessions.a={chromeGroupId:1};backend.store.state.sessions.b={chromeGroupId:2};backend.sessionByTabId.set(1,'a');backend.navigationSourcesByTabId.set(2,{sourceTabId:1,sessionId:'a'});
     const pending=backend.getSessionTabs('a');while(!release)await new Promise(resolve=>setImmediate(resolve));backend.handleTabGroupChange(2,2);release({id:2,groupId:-1});
     assert.deepEqual((await pending).map(tab=>tab.id),[1]);assert.equal(backend.sessionByTabId.get(2),'b');
+  } finally {chrome.tabs=oldTabs;}
+});
+
+test('popup claims survive worker restart, remain isolated, and are removed on release',async()=>{
+  const oldTabs=chrome.tabs,oldNav=chrome.webNavigation,oldWindows=chrome.windows,oldGet=chrome.storage.local.get,oldSet=chrome.storage.local.set;let saved={},observe;
+  const tabs=new Map([[1,{id:1,groupId:1,windowId:1,url:'https://example.test/'}],[2,{id:2,groupId:-1,windowId:2,url:'https://example.test/popup'}]]);
+  chrome.storage.local.get=async key=>structuredClone({[key]:saved[key]});chrome.storage.local.set=async value=>{saved={...saved,...structuredClone(value)};};
+  chrome.tabs={query:async({groupId})=>[...tabs.values()].filter(tab=>tab.groupId===groupId).map(tab=>({...tab})),get:async id=>{const tab=tabs.get(id);if(!tab)throw Error('missing');return {...tab};},sendMessage:async()=>({ok:true}),ungroup:async()=>{}};
+  chrome.windows={get:async()=>({type:'popup'})};chrome.webNavigation={onCreatedNavigationTarget:{addListener(callback){observe=callback;}}};
+  try {
+    const first=new Backend();await first.store.ready;first.store.state.sessions.a={chromeGroupId:1,tabOrigins:{}};first.store.state.sessions.b={chromeGroupId:null,tabOrigins:{}};
+    await first.getSessionTabs('a');observe({sourceTabId:1,tabId:2});assert.deepEqual(Array.from(await first.getSessionTabs('a'),t=>t.id),[1,2]);
+    const second=new Backend();await second.store.ready;second.requireSession=async params=>({sessionId:params.session_id});second.detachMany=async()=>{};
+    assert.deepEqual(Array.from(await second.getSessionTabs('a'),t=>t.id),[1,2]);assert.equal((await second.getSessionTabs('b')).length,0);
+    await assert.rejects(second.claimUserTab({session_id:'b',tabId:2}),/already part of browser session a/);
+    await second.finalizeTabs({session_id:'a',keep:[{tabId:1,status:'handoff'}]});assert.equal(tabs.has(2),true);
+    const third=new Backend();await third.store.ready;assert.deepEqual(Array.from(await third.getSessionTabs('a'),t=>t.id),[1]);assert.equal(third.store.state.sessions.a.popupClaims?.['2'],undefined);
+  } finally {chrome.tabs=oldTabs;chrome.webNavigation=oldNav;chrome.windows=oldWindows;chrome.storage.local.get=oldGet;chrome.storage.local.set=oldSet;}
+});
+
+test('stale popup IDs cannot restore or block a different browser target',async()=>{
+  const oldTabs=chrome.tabs,oldTargets=chrome.debugger.getTargets;
+  chrome.tabs={query:async()=>[{id:1,groupId:1}],get:async()=>({id:2,groupId:-1,windowId:2,url:'https://example.test/'})};
+  chrome.debugger.getTargets=async()=>[{tabId:2,type:'page',id:'new-target'}];
+  try {
+    const backend=new Backend();await backend.store.ready;backend.store.state.sessions.a={chromeGroupId:1,tabOrigins:{},popupClaims:{'2':{targetId:'old-target',windowId:2}}};
+    assert.deepEqual(Array.from(await backend.getSessionTabs('a'),t=>t.id),[1]);assert.equal(backend.sessionByTabId.has(2),false);assert.equal(backend.store.state.sessions.a.popupClaims['2'],undefined);
+  } finally {chrome.tabs=oldTabs;chrome.debugger.getTargets=oldTargets;}
+});
+
+test('popup closure during storage loading removes persisted ownership and active state',async()=>{
+  const oldTabs=chrome.tabs,oldGet=chrome.storage.local.get,oldSet=chrome.storage.local.set;let removed,release,saved;
+  chrome.tabs={onRemoved:{addListener(callback){removed=callback;}}};chrome.storage.local.get=async()=>await new Promise(resolve=>{release=resolve;});chrome.storage.local.set=async value=>{saved=structuredClone(value);};
+  try {
+    const backend=new Backend();while(!release)await new Promise(resolve=>setImmediate(resolve));removed(2);
+    release({OPEN_BROWSER_USE_SESSION_STATE:{sessions:{a:{chromeGroupId:null,activeTabId:2,tabOrigins:{'2':'user'},popupClaims:{'2':{targetId:'target-2',windowId:8}}}},deliverableGroupId:null}});
+    await backend.store.ready;await new Promise(resolve=>setImmediate(resolve));await backend.store.saveQueue;
+    const session=saved.OPEN_BROWSER_USE_SESSION_STATE.sessions.a;assert.equal(session.activeTabId,null);assert.equal(session.popupClaims['2'],undefined);assert.equal(session.tabOrigins['2'],undefined);
+  } finally {chrome.tabs=oldTabs;chrome.storage.local.get=oldGet;chrome.storage.local.set=oldSet;}
+});
+
+test('popup restore rejects a changed window and removes the stored claim',async()=>{
+  const oldTabs=chrome.tabs;chrome.tabs={query:async()=>[{id:1,groupId:1}],get:async()=>({id:2,groupId:-1,windowId:9,url:'https://example.test/'})};
+  try {
+    const backend=new Backend();await backend.store.ready;backend.store.state.sessions.a={chromeGroupId:1,tabOrigins:{},popupClaims:{'2':{targetId:'target-2',windowId:8}}};
+    assert.deepEqual(Array.from(await backend.getSessionTabs('a'),tab=>tab.id),[1]);assert.equal(backend.store.state.sessions.a.popupClaims['2'],undefined);
+  } finally {chrome.tabs=oldTabs;}
+});
+
+test('closing a popup during a delayed persistence write cannot resurrect its claim',async()=>{
+  const oldTabs=chrome.tabs,oldNav=chrome.webNavigation,oldSet=chrome.storage.local.set;let observe,removed,release,writes=0,saved;
+  chrome.tabs={query:async()=>[{id:1,groupId:1,windowId:1}],get:async()=>({id:2,groupId:-1,windowId:2,url:'https://example.test/'}),onRemoved:{addListener(callback){removed=callback;}}};
+  chrome.webNavigation={onCreatedNavigationTarget:{addListener(callback){observe=callback;}}};
+  chrome.storage.local.set=async value=>{const snapshot=structuredClone(value);if(++writes===1)await new Promise(resolve=>{release=resolve;});saved=snapshot;};
+  try {
+    const backend=new Backend();await backend.store.ready;backend.store.state.sessions.a={chromeGroupId:1,activeTabId:1,tabOrigins:{}};backend.sessionByTabId.set(1,'a');observe({sourceTabId:1,tabId:2});
+    const pending=backend.getSessionTabs('a');while(!release)await new Promise(resolve=>setImmediate(resolve));removed(2);await new Promise(resolve=>setImmediate(resolve));release();
+    assert.deepEqual(Array.from(await pending,tab=>tab.id),[1]);await backend.store.saveQueue;assert.equal(saved.OPEN_BROWSER_USE_SESSION_STATE.sessions.a.popupClaims['2'],undefined);
+  } finally {chrome.tabs=oldTabs;chrome.webNavigation=oldNav;chrome.storage.local.set=oldSet;}
+});
+
+test('a temporary group query failure preserves persisted popup claims',async()=>{
+  const oldTabs=chrome.tabs;chrome.tabs={query:async()=>{throw Error('temporary failure');}};
+  try {
+    const backend=new Backend();await backend.store.ready;backend.store.state.sessions.a={chromeGroupId:1,tabOrigins:{},popupClaims:{'2':{targetId:'target-2',windowId:8}}};
+    await assert.rejects(backend.getSessionTabs('a'),/Could not query/);assert.equal(backend.store.state.sessions.a.popupClaims['2'].targetId,'target-2');
   } finally {chrome.tabs=oldTabs;}
 });

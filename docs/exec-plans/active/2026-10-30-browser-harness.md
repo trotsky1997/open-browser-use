@@ -163,7 +163,7 @@
 - [x] 下载开始观察超时时取消 frame 自动附着及挂起的 frame 准备；Linux ARM64 Chromium 原生消息验证超时后重新观察实际下载。
 - [x] Playwright 风格 waitForEvent("dialog") 在后续 SDK 输入前准备监听，准备与事件等待共享期限；Linux ARM64 Chromium 原生消息实测延迟准备和真实 confirm 点击。
 - [x] Playwright 风格 waitForEvent("popup") 在后续 SDK 输入前获取所属标签基线，复用 opener 与歧义检查；Linux ARM64 Chromium 原生消息验证前台标签链接。
-- [x] Chrome 使用 webNavigation 事件识别受控来源标签的新页，并在查询时核对来源和目标的会话归属；Linux ARM64 Chromium 后台标签及 noopener 链接验证通过。来源记录保存在 service worker 内存。
+- [x] Chrome 使用 webNavigation 事件识别受控来源标签的新页，并在查询时核对来源和目标的会话归属；Linux ARM64 Chromium 后台标签及 noopener 链接验证通过。独立 popup 的归属持久化到扩展本地存储，重启后校验浏览器目标、窗口和分组再恢复。
 - [x] Chrome 将受控来源创建的未分组独立窗口纳入原会话；跨会话接管拒绝，用户移组后撤销，结束时释放窗口。Linux ARM64 Chromium 原生消息实测跨窗口、可信点击、来源关闭和清理。
 - [x] 创建新会话标签时在标签所属正常窗口创建组，避免弹窗置顶时选择错误窗口；Linux ARM64 Chromium 实测。
 - [x] Chrome 支持无标签组会话显式接管已释放的独立窗口；接管和活动标签更新复核归属。Linux ARM64 Chromium 原生消息验证。

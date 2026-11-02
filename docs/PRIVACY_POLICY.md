@@ -36,7 +36,7 @@ local tools.
 ## Data storage
 
 The extension may store local operational state in Chrome extension storage,
-such as session metadata needed to recover tab groups and native host status. Navigation-target source and target tab IDs for controlled source tabs are held in service-worker memory until the target closes, the session releases it, or the worker restarts.
+such as session metadata needed to recover tab groups and native host status. Popup ownership records include session, source and target tab IDs, browser target ID, and window ID in local extension storage. They are removed when the popup closes, moves out of its owned window, or is released.
 This data remains in the user's Chrome profile unless the user removes the
 extension or clears browser extension data.
 

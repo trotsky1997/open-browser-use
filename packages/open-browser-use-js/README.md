@@ -99,7 +99,7 @@ const popup = await waiting;
 `browser.tabs.list()` exposes an `openerTabId` when both tabs are in the
 same session and the backend knows the opener.
 It polls owned tabs, so a popup closed before observation or without an opener
-can time out. Chrome uses navigation-target events from controlled source tabs to associate new ungrouped popup windows with that session. Moving a popup into another group revokes its previous ownership. These source and ownership records are in memory and are lost if the extension service worker restarts; released ungrouped popups remain open and can be explicitly claimed again. Concurrent matching popups are rejected as ambiguous, and only one popup
+can time out. Chrome uses navigation-target events from controlled source tabs to associate new ungrouped popup windows with that session. Moving a popup into another group revokes its previous ownership. Popup ownership is stored locally and restored after an extension restart when the tab, browser target, window, and group still match. Released ungrouped popups remain open and can be explicitly claimed again. Concurrent matching popups are rejected as ambiguous, and only one popup
 expectation per opener can run in a browser instance. The timeout includes
 tab-list preparation. If preparation times out, the action is not issued;
 a timeout after the action starts means it may still be running, so inspect

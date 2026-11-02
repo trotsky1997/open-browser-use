@@ -190,6 +190,7 @@ class NativeTransport {
 class SessionStore {
   constructor() {
     this.state = { sessions: {}, deliverableGroupId: null };
+    this.saveQueue = Promise.resolve();
     this.ready = this.load();
   }
 
@@ -226,7 +227,9 @@ class SessionStore {
   }
 
   async save() {
-    await chrome.storage.local.set({ [SESSION_STATE_KEY]: this.state });
+    const pending=this.saveQueue.catch(() => {}).then(() => chrome.storage.local.set({ [SESSION_STATE_KEY]: this.state }));
+    this.saveQueue=pending;
+    await pending;
   }
 
   async getSession(sessionId) {
@@ -239,7 +242,8 @@ class SessionStore {
       chromeGroupId: null,
       title: DEFAULT_SESSION_GROUP_TITLE,
       activeTabId: null,
-      tabOrigins: {}
+      tabOrigins: {},
+      popupClaims: {}
     };
     this.state.sessions[sessionId] = created;
     await this.save();
@@ -364,6 +368,15 @@ class BrowserBackend {
       }
     });
     chrome.tabs?.onRemoved?.addListener((tabId) => {
+      void this.store.ready.then(async () => {
+        for (const session of Object.values(this.store.state.sessions)) {
+          if (session?.popupClaims?.[String(tabId)]) {
+            if (session.activeTabId===tabId) session.activeTabId=null;
+            if (session.tabOrigins) delete session.tabOrigins[String(tabId)];
+          }
+        }
+        await this.forgetPopupClaim(tabId);
+      }).catch(() => {});
       this.navigationSourcesByTabId.delete(tabId);
       this.tabGroupRevisions.set(tabId, ++this.groupRevision);
       if (this.downloadStartWait?.tabId === tabId) this.downloadStartWait.controller.abort();
@@ -373,8 +386,18 @@ class BrowserBackend {
       if (session?.activeTabId === tabId) { session.activeTabId=null; void this.store.save().catch(() => {}); }
       this.cursorByTabId.delete(tabId);
     });
+    chrome.tabs?.onDetached?.addListener((tabId) => {
+      this.tabGroupRevisions.set(tabId,++this.groupRevision);
+      void this.store.ready.then(() => {
+        const stored=Object.values(this.store.state.sessions).some(session=>session?.popupClaims?.[String(tabId)]);
+        if (stored || this.navigationSourcesByTabId.get(tabId)?.claimed) this.handleTabGroupChange(tabId,-1);
+      }).catch(() => {});
+    });
     chrome.tabs?.onUpdated?.addListener((tabId, change) => {
-      if (typeof change.groupId === "number") this.handleTabGroupChange(tabId, change.groupId);
+      if (typeof change.groupId === "number") {
+        this.tabGroupRevisions.set(tabId,++this.groupRevision);
+        void this.store.ready.then(() => this.handleTabGroupChange(tabId, change.groupId)).catch(() => {});
+      }
     });
   }
 
@@ -382,9 +405,12 @@ class BrowserBackend {
     this.tabGroupRevisions.set(tabId, ++this.groupRevision);
     const owner = Object.entries(this.store.state.sessions).find(([,session]) => session?.chromeGroupId === groupId && groupId !== -1)?.[0];
     const ungrouped = this.pendingUngrouped.get(tabId);
-    const previous = this.sessionByTabId.get(tabId) ?? this.debuggerSessionByTabId.get(tabId) ?? ungrouped?.sessionId;
+    const storedOwners=Object.entries(this.store.state.sessions).filter(([,session])=>session?.popupClaims?.[String(tabId)]);
+    const storedOwner=storedOwners.length===1 ? storedOwners[0][0] : undefined;
+    const previous = this.sessionByTabId.get(tabId) ?? this.debuggerSessionByTabId.get(tabId) ?? ungrouped?.sessionId ?? storedOwner;
     if (groupId !== -1) this.pendingUngrouped.delete(tabId);
     if (owner) this.sessionByTabId.set(tabId, owner); else this.sessionByTabId.delete(tabId);
+    if (storedOwners.length) void this.forgetPopupClaim(tabId).catch(() => {});
     if (!previous || (previous === owner && !ungrouped)) return;
     const source=this.navigationSourcesByTabId.get(tabId);
     if (source?.sessionId === previous) source.released=true;
@@ -411,6 +437,16 @@ class BrowserBackend {
     }, () => {
       setTimeout(() => { if (this.pendingUngrouped.get(tabId) === pending) this.pendingUngrouped.delete(tabId); }, 1000);
     });
+  }
+
+  async forgetPopupClaim(tabId) {
+    let changed=false;
+    for (const session of Object.values(this.store.state.sessions)) {
+      if (session?.popupClaims && Object.hasOwn(session.popupClaims,String(tabId))) {
+        delete session.popupClaims[String(tabId)];changed=true;
+      }
+    }
+    if (changed) await this.store.save();
   }
 
   takeClosedOwner(tabId) {
@@ -566,11 +602,17 @@ class BrowserBackend {
     if (window?.type === "popup") {
       const revision=this.tabGroupRevisions.get(tabId) ?? 0;
       const state=await this.store.getSession(session.sessionId);
+      const targets=await chrome.debugger.getTargets();
+      const target=targets.find(item=>item.tabId===tabId && item.type==="page" && typeof item.id==="string" && item.id);
+      if (!target) throw new Error("Popup browser target is unavailable");
+      const conflicting=Object.entries(this.store.state.sessions).find(([id,value])=>id!==session.sessionId && value?.popupClaims?.[String(tabId)]?.targetId===target.id);
+      if (conflicting) throw new Error(`Tab ${tabId} is already part of browser session ${conflicting[0]}`);
       const latest=await chrome.tabs.get(tabId);
       const owner=this.sessionByTabId.get(tabId);
       if (latest.groupId !== -1 || latest.windowId !== tab.windowId || (this.tabGroupRevisions.get(tabId) ?? 0)!==revision || (owner && owner !== session.sessionId)) throw new Error("Tab ownership changed while claiming popup");
-      this.navigationSourcesByTabId.set(tabId,{sessionId:session.sessionId,claimed:true});
+      this.navigationSourcesByTabId.set(tabId,{sessionId:session.sessionId,claimed:true,targetId:target.id,windowId:latest.windowId});
       this.sessionByTabId.set(tabId,session.sessionId);
+      (state.popupClaims ??= {})[String(tabId)]={targetId:target.id,windowId:latest.windowId};
       state.tabOrigins[String(tabId)]="user";
       await this.store.save();
       await this.setSessionActiveTab(session.sessionId,tabId);
@@ -664,6 +706,7 @@ class BrowserBackend {
     }
     for (const tabId of [...agentTabsToClose, ...userTabsToRelease, ...deliverableTabs]) {
       delete sessionState.tabOrigins[String(tabId)];
+      if (sessionState.popupClaims) delete sessionState.popupClaims[String(tabId)];
       this.navigationSourcesByTabId.delete(tabId);
       this.cursorByTabId.delete(tabId);
       if (!agentTabsToClose.includes(tabId)) this.sessionByTabId.delete(tabId);
@@ -1364,32 +1407,66 @@ class BrowserBackend {
 
   async getSessionTabs(sessionId) {
     const session = await this.store.getSession(sessionId);
-    try {
-      const revision = this.groupRevision;
-      const grouped=typeof session.chromeGroupId === "number" ? await chrome.tabs.query({ groupId: session.chromeGroupId }) : [];
-      const tabs = grouped.filter(
-        (tab) => hasTabId(tab) && !tab.url?.startsWith("chrome://") && (this.tabGroupRevisions.get(tab.id) ?? 0) <= revision
-      );
-      const known=new Set(tabs.map(tab=>tab.id));
+    const revision = this.groupRevision;
+    let grouped;
+    try { grouped=typeof session.chromeGroupId === "number" ? await chrome.tabs.query({ groupId: session.chromeGroupId }) : []; }
+    catch (error) { throw new Error("Could not query browser session tabs",{cause:error}); }
+    const tabs = grouped.filter(tab => hasTabId(tab) && !tab.url?.startsWith("chrome://") && (this.tabGroupRevisions.get(tab.id) ?? 0) <= revision);
+    if (this.store.state.sessions[sessionId] !== session) throw new Error("Browser session changed");
+    const known=new Set(tabs.map(tab=>tab.id));
+    const claims=session.popupClaims && typeof session.popupClaims === "object" ? session.popupClaims : {};
+    const hasSources=[...this.navigationSourcesByTabId.values()].some(source=>source.sessionId===sessionId && !source.released);
+    if (hasSources || Object.keys(claims).length) {
+      const targets=await chrome.debugger.getTargets();
+      const targetIds=new Map(targets.filter(item=>item.type==="page" && Number.isInteger(item.tabId) && typeof item.id==="string" && item.id).map(item=>[item.tabId,item.id]));
+      let dirty=false;
+      for (const [key,claim] of Object.entries(claims)) {
+        const id=Number(key);
+        if (!Number.isSafeInteger(id) || String(id)!==key || !claim || typeof claim.targetId!=="string" || !Number.isInteger(claim.windowId) || (targetIds.has(id) && targetIds.get(id)!==claim.targetId)) { delete claims[key];dirty=true;continue; }
+        if (!targetIds.has(id)) {
+          try { await chrome.tabs.get(id); } catch(error) {
+            if (/^No tab with id/i.test(String(error?.message ?? error))) { delete claims[key];dirty=true; }
+          }
+          continue;
+        }
+        const conflict=Object.entries(this.store.state.sessions).some(([other,value])=>other!==sessionId && value?.popupClaims?.[key]?.targetId===claim.targetId);
+        if (conflict) continue;
+        if (!this.navigationSourcesByTabId.has(id)) this.navigationSourcesByTabId.set(id,{sessionId,claimed:true,restored:true,targetId:claim.targetId,windowId:claim.windowId,...(Number.isInteger(claim.sourceTabId) ? {sourceTabId:claim.sourceTabId} : {})});
+      }
       const sources=[...this.navigationSourcesByTabId.entries()].filter(([,source])=>source.sessionId===sessionId && !source.released);
       const candidates=await Promise.all(sources.map(async ([id,source])=>({id,source,tab:await chrome.tabs.get(id).catch(()=>null)})));
+      if (this.store.state.sessions[sessionId] !== session) throw new Error("Browser session changed");
+      for (const {id,source,tab} of candidates) {
+        if (source.restored && tab && (tab.groupId!==-1 || tab.windowId!==source.windowId)) {
+          delete claims[String(id)];dirty=true;
+          if (this.navigationSourcesByTabId.get(id)===source) this.navigationSourcesByTabId.delete(id);
+        }
+      }
       let changed=true;
       while(changed) {
         changed=false;
         for(const {id,source,tab} of candidates) {
-          if(known.has(id) || !tab || tab.groupId!==-1 || tab.url?.startsWith("chrome://") || source.released || this.navigationSourcesByTabId.get(id)!==source || (this.tabGroupRevisions.get(id) ?? 0)>revision || (this.tabGroupRevisions.get(source.sourceTabId) ?? 0)>revision) continue;
+          const targetId=targetIds.get(id);
+          if(known.has(id) || !tab || tab.groupId!==-1 || !Number.isInteger(tab.windowId) || (source.windowId!==undefined && source.windowId!==tab.windowId) || tab.url?.startsWith("chrome://") || !targetId || (source.targetId && source.targetId!==targetId) || source.released || this.navigationSourcesByTabId.get(id)!==source || (this.tabGroupRevisions.get(id) ?? 0)>revision || (this.tabGroupRevisions.get(source.sourceTabId) ?? 0)>revision) continue;
           const existing=this.sessionByTabId.get(id);
           if(existing && existing!==sessionId)continue;
-          if(!(source.claimed && existing===sessionId) && !known.has(source.sourceTabId))continue;
-          source.claimed=true;known.add(id);tabs.push(tab);changed=true;
+          const stored=claims[String(id)];
+          const restored=source.restored && stored?.targetId===targetId && stored.windowId===tab.windowId;
+          if(!restored && !(source.claimed && existing===sessionId) && !known.has(source.sourceTabId))continue;
+          const conflict=Object.entries(this.store.state.sessions).some(([other,value])=>other!==sessionId && value?.popupClaims?.[String(id)]?.targetId===targetId);
+          if(conflict)continue;
+          if(!stored || stored.targetId!==targetId) {
+            (session.popupClaims ??= {})[String(id)]={targetId,windowId:tab.windowId,...(Number.isInteger(source.sourceTabId) ? {sourceTabId:source.sourceTabId} : {})};dirty=true;
+          }
+          source.claimed=true;source.targetId=targetId;source.windowId=tab.windowId;source.restored=false;this.sessionByTabId.set(id,sessionId);known.add(id);tabs.push(tab);changed=true;
         }
       }
-      for (const tab of tabs) this.sessionByTabId.set(tab.id, sessionId);
-      return tabs;
-    } catch {
-      await this.store.removeSession(sessionId);
-      return [];
+      if(dirty)await this.store.save();
     }
+    if (this.store.state.sessions[sessionId] !== session) throw new Error("Browser session changed");
+    const valid=tabs.filter(tab=>(this.tabGroupRevisions.get(tab.id) ?? 0)<=revision && (!this.sessionByTabId.has(tab.id) || this.sessionByTabId.get(tab.id)===sessionId));
+    for (const tab of valid) this.sessionByTabId.set(tab.id, sessionId);
+    return valid;
   }
 
   async requireSession(params) {
