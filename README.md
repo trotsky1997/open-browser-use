@@ -1,6 +1,6 @@
 # Open Browser Use
 
-> This branch is the [open-office-use fork](https://github.com/trotsky1997/open-office-use/tree/codex/browser-harness), based on [iFurySt/open-browser-use](https://github.com/iFurySt/open-browser-use). Its newer browser harness is available from this source tree. The npm, PyPI, Homebrew and Chrome Web Store links below refer to upstream releases and may contain different code.
+> This branch is the [open-browser-harness fork](https://github.com/trotsky1997/open-browser-harness), based on [iFurySt/open-browser-use](https://github.com/iFurySt/open-browser-use). Its newer browser harness is available from this source tree. The npm, PyPI, Homebrew and Chrome Web Store links below refer to upstream releases and may contain different code.
 
 [![English](https://img.shields.io/badge/English-Click-yellow)](./README.md)
 [![简体中文](https://img.shields.io/badge/简体中文-点击查看-orange)](./README.zh-CN.md)
@@ -39,8 +39,8 @@ toolchain for the Electron workspace dependency. From a checkout of the
 `codex/browser-harness` branch:
 
 ```bash
-git clone --branch codex/browser-harness https://github.com/trotsky1997/open-office-use.git
-cd open-office-use
+git clone https://github.com/trotsky1997/open-browser-harness.git
+cd open-browser-harness
 pnpm install --frozen-lockfile
 pnpm --filter open-browser-use-sdk build
 mkdir -p build
@@ -81,7 +81,7 @@ file:
 ```toml
 [mcp_servers.open_browser_use_repl]
 command = "node"
-args = ["/absolute/path/to/open-office-use/packages/open-browser-use-js/dist/repl-cli.js"]
+args = ["/absolute/path/to/open-browser-harness/packages/open-browser-use-js/dist/repl-cli.js"]
 ```
 
 Use the [local skill](skills/open-browser-use/SKILL.md) and the

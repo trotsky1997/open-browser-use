@@ -1,6 +1,6 @@
 # Open Browser Use
 
-> 本分支是基于 [iFurySt/open-browser-use](https://github.com/iFurySt/open-browser-use) 的 [open-office-use fork](https://github.com/trotsky1997/open-office-use/tree/codex/browser-harness)。新版 browser harness 从本分支源码构建；下方 npm、PyPI、Homebrew 和 Chrome Web Store 链接指向上游发布版本，代码可能不同。
+> 本分支是基于 [iFurySt/open-browser-use](https://github.com/iFurySt/open-browser-use) 的 [open-browser-harness fork](https://github.com/trotsky1997/open-browser-harness)。新版 browser harness 从本分支源码构建；下方 npm、PyPI、Homebrew 和 Chrome Web Store 链接指向上游发布版本，代码可能不同。
 
 [![English](https://img.shields.io/badge/English-Click-yellow)](./README.md)
 [![简体中文](https://img.shields.io/badge/简体中文-点击查看-orange)](./README.zh-CN.md)
@@ -32,8 +32,8 @@ https://github.com/user-attachments/assets/bcfba878-f6a8-44b9-b84b-29c7e0285687
 分支的工作目录中执行：
 
 ```bash
-git clone --branch codex/browser-harness https://github.com/trotsky1997/open-office-use.git
-cd open-office-use
+git clone https://github.com/trotsky1997/open-browser-harness.git
+cd open-browser-harness
 pnpm install --frozen-lockfile
 pnpm --filter open-browser-use-sdk build
 mkdir -p build
@@ -66,7 +66,7 @@ Open Browser Use 原生 host 清单和稳定链接，使用同一 host 名称的
 ```toml
 [mcp_servers.open_browser_use_repl]
 command = "node"
-args = ["/absolute/path/to/open-office-use/packages/open-browser-use-js/dist/repl-cli.js"]
+args = ["/absolute/path/to/open-browser-harness/packages/open-browser-use-js/dist/repl-cli.js"]
 ```
 
 浏览器发现、操作和清理方法见 [SDK 指南](packages/open-browser-use-js/README.md)
